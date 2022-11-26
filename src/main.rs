@@ -1,12 +1,18 @@
 mod fs;
+#[macro_use]
+extern crate log;
 
+use fuser::MountOption;
 use std::env;
 use std::path::Path;
 use std::time::Duration;
 
-const TTL: Duration = Duration::from_millis(500);
+const TTL: Duration = Duration::from_millis(50000);
 
 fn main() {
+    env_logger::init();
+    info!("MergeFS Started");
+
     let args = env::args().collect::<Vec<String>>();
 
     let (mp, rest) = match &args[1..] {
@@ -18,5 +24,10 @@ fn main() {
     };
 
     let merged_fs = fs::merged::MergedFS::new(rest.iter().map(|x| Path::new(x)));
-    fuser::mount2(merged_fs, mp, &[]).unwrap();
+    fuser::mount2(
+        merged_fs,
+        mp,
+        &[MountOption::AutoUnmount, MountOption::DefaultPermissions],
+    )
+    .unwrap();
 }

@@ -1,9 +1,15 @@
 use crate::fs::inode::INodeTable;
+use fuser::FileAttr;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::result::Result;
 
+use crate::fs::attrs;
+
+#[derive(Debug)]
 pub struct Source {
     root: PathBuf,
     inodes: INodeTable,
@@ -11,10 +17,16 @@ pub struct Source {
 
 impl<'a> Source {
     pub fn new(root: PathBuf) -> Self {
+        debug!("Source::new({})", root.display());
         Source {
             root,
             inodes: INodeTable::new(),
         }
+    }
+
+    pub fn statfs(&self) -> io::Result<crate::fs::stats::FSStats> {
+        debug!("Source::{}::statfs", self.root.display());
+        attrs::fsstat(&self.root)
     }
 
     fn extend_root<P: AsRef<Path>>(&self, path_ref: P) -> PathBuf {
@@ -25,10 +37,22 @@ impl<'a> Source {
         } else {
             path.to_path_buf()
         };
-        root.join(rel_path)
+        let got = root.join(rel_path);
+        debug!(
+            "extending root, {}, onto {} --> {}",
+            self.root.display(),
+            path.display(),
+            got.display()
+        );
+        got
     }
 
     pub fn read_dir<P: AsRef<Path>>(&'a self, path_ref: P) -> io::Result<ReadDir> {
+        debug!(
+            "Source::{}::readdir({})",
+            self.root.display(),
+            path_ref.as_ref().display()
+        );
         match fs::read_dir(self.extend_root(path_ref).as_path()) {
             Ok(rd) => Ok(ReadDir::<'a> { rd, src: self }),
             Err(x) => Err(x),
@@ -36,15 +60,55 @@ impl<'a> Source {
     }
 
     pub fn create_dir<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        debug!(
+            "Source::{}::create_dir({})",
+            self.root.display(),
+            path.as_ref().display()
+        );
         fs::create_dir(self.extend_root(path))
     }
 
     pub fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        debug!(
+            "Source::{}::create_dir_all({})",
+            self.root.display(),
+            path.as_ref().display()
+        );
         fs::create_dir_all(self.extend_root(path))
     }
 
     pub fn metadata<P: AsRef<Path>>(&self, path: P) -> io::Result<fs::Metadata> {
+        debug!(
+            "Source::{}::metadata({})",
+            self.root.display(),
+            path.as_ref().display()
+        );
         fs::metadata(self.extend_root(path))
+    }
+
+    pub fn fuse_attr_path<P: AsRef<Path>>(&self, path: P) -> io::Result<FileAttr> {
+        debug!(
+            "Source::{}::fuse_attr_path({})",
+            self.root.display(),
+            path.as_ref().display()
+        );
+        let pb = path.as_ref().to_path_buf().into_os_string();
+
+        if let Some(ino) = self.inodes.lookup_inode_from_merged_path(&pb) {
+            attrs::fuse_attr(ino, self.extend_root(path))
+        } else {
+            Err(io::Error::new(ErrorKind::NotFound, "not found"))
+        }
+    }
+
+    pub fn fuse_attr(&self, ino: u64) -> io::Result<FileAttr> {
+        debug!("Source::{}::fuse_attr({})", self.root.display(), ino);
+        let path = self.inodes.lookup_merged_path_from_inode(ino);
+        if let None = path {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "not found"));
+        }
+        let path = path.unwrap();
+        attrs::fuse_attr(ino, self.extend_root(path))
     }
 }
 
@@ -57,18 +121,26 @@ impl<'a> Iterator for ReadDir<'a> {
     type Item = Result<DirEntry<'a>, std::io::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.rd.next() {
+        debug!("Source::{}::Iterator::next", self.src.root.display());
+        let val = match self.rd.next() {
             None => None,
             Some(Ok(item)) => {
-                let os_path = item.path().into_os_string();
-                let inode = self.src.inodes.lookup_inode_from_merged_path(&os_path);
+                let item_path = item.path();
+                let merged_path = strip_root(item_path, &self.src.root);
+                let inode = self
+                    .src
+                    .inodes
+                    .lookup_insert_inode_from_merged_path(&merged_path.into_os_string());
                 Some(Ok(DirEntry::from_dir_entry(self.src, item, inode)))
             }
             Some(Err(x)) => Some(Err(x)),
-        }
+        };
+        debug!("next is {:?}", val);
+        val
     }
 }
 
+#[derive(Debug)]
 pub struct DirEntry<'a> {
     inode: u64,
     d: fs::DirEntry,
@@ -84,17 +156,14 @@ impl<'a> DirEntry<'a> {
         self.inode
     }
 
-    pub fn dir_entry(&'a self) -> &'a fs::DirEntry {
-        &self.d
+    pub fn file_name(&self) -> OsString {
+        self.d.file_name()
     }
 
     pub fn path_within_source(&self) -> PathBuf {
-        self.d
-            .path()
-            .clone()
-            .strip_prefix(self.src.root.clone())
-            .unwrap()
-            .to_path_buf()
+        let out = strip_root(&self.d.path(), &self.src.root);
+        debug!("DirEntry::path_within_source -- source root is {}, full path is {}, path within source is {}", self.src.root.display(), self.d.path().display(), out.display());
+        out
     }
 
     pub fn is_dir(&self) -> Option<bool> {
@@ -103,4 +172,10 @@ impl<'a> DirEntry<'a> {
         }
         None
     }
+}
+
+fn strip_root<P: AsRef<Path>, Q: AsRef<Path>>(path: P, root: Q) -> PathBuf {
+    let mut out = PathBuf::from("/");
+    out.push(path.as_ref().strip_prefix(root.as_ref()).unwrap());
+    out
 }

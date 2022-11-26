@@ -1,0 +1,3 @@
+total 8
+-rw-r--r--  1 harry  staff  29 26 Nov 21:46 testfile2.txt
+-rw-r--r--  1 harry  staff   0 26 Nov 21:46 testfile3.txt
