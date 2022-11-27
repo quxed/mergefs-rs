@@ -1,4 +1,4 @@
-use crate::fs::inode::INodeTable;
+use crate::fs::inode::{INode, INodeTable};
 use crate::fs::source::Source;
 use crate::{fs, TTL};
 
@@ -9,7 +9,7 @@ use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyStatfs, Request,
 };
-use libc::{c_int, ENOENT};
+use libc::{c_int, EINVAL, EIO, ENOENT};
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -18,13 +18,11 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use std::{io, mem};
 
-const SOURCE_INODE_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
-const IS_DIR_MASK: u64 = 0xA000_0000_0000_0000;
-const MERGED_SOURCE_MASK: u64 = !(SOURCE_INODE_MASK | IS_DIR_MASK);
+const FILE_HANDLE_READ_BIT: u64 = 1 << 63;
 
 pub struct MergedFS {
     sources: Vec<Source>,
-    directories: INodeTable, // directories are mapped across all disks.
+    directories: INodeTable<u64>, // directories are mapped across all disks.
 }
 
 impl MergedFS {
@@ -76,42 +74,45 @@ impl MergedFS {
         });
     }
 
-    fn get_attr_dir(&self, ino: u64) -> Option<fuser::FileAttr> {
+    fn get_attr_dir(&self, ino: INode) -> Option<fuser::FileAttr> {
         debug!("MergedFS::get_attr_dir({:#x})", ino);
-        let ino = ino & SOURCE_INODE_MASK;
-        let dir = self.directories.lookup_merged_path_from_inode(ino)?;
-        for v in &self.sources {
-            if let Ok(x) = v.fuse_attr_path(&dir) {
-                return Some(x);
+        match ino {
+            INode::Dir(ino) => {
+                let dir = self.directories.lookup_merged_path_from_inode(ino)?;
+                for v in &self.sources {
+                    if let Ok(x) = v.fuse_attr_path(&dir) {
+                        return Some(x);
+                    }
+                }
+                return None;
             }
+            _ => return None,
         }
-        return None;
     }
 
     fn fuse_attr(&self, ino: u64) -> Option<FileAttr> {
-        if ino == 1 || (IS_DIR_MASK & ino) > 0 {
-            // directory
-            return self.get_attr_dir(ino);
-        }
-        // so it's a file (we assume!)
-        let source = (ino & MERGED_SOURCE_MASK) >> 48;
-        let src = self.sources.get(source as usize)?;
-        let src_inode = ino & SOURCE_INODE_MASK;
-
-        let attr = src.fuse_attr(src_inode);
-        if let Err(e) = attr {
-            if e.kind() != ErrorKind::NotFound {
-                error!(
-                    "error getting attributes for inode {:#x} -> ({}, {}): {}",
-                    ino, source, src_inode, e
-                );
-                return None;
+        let ino = INode::from(ino);
+        match ino {
+            d @ INode::Dir(x) => self.get_attr_dir(d),
+            f @ INode::File(source_idx, src_inode) => {
+                // so it's a file (we assume!)
+                let src = self.sources.get(source_idx as usize)?;
+                let attr = src.fuse_attr(src_inode);
+                if let Err(e) = attr {
+                    if e.kind() != ErrorKind::NotFound {
+                        error!(
+                            "error getting attributes for inode {:#x} -> ({}, {}): {}",
+                            ino, source_idx, src_inode, e
+                        );
+                        return None;
+                    }
+                    return None;
+                }
+                let mut attr = attr.unwrap();
+                attr.ino = f.into(); // to make sure we're including the source bits in the inode.
+                return Some(attr);
             }
-            return None;
         }
-        let mut attr = attr.unwrap();
-        attr.ino = ino; // to make sure we're including the source bits in the inode.
-        return Some(attr);
     }
 
     fn fuse_attr_from_path<P: AsRef<Path>>(&self, path: P) -> Option<FileAttr> {
@@ -128,13 +129,23 @@ impl MergedFS {
         // not a directory, and we don't have any inode, so this isn't going to be a fun lookup.
         for (idx, src) in (0..).zip(&self.sources) {
             if let Ok(mut attr) = src.fuse_attr_path(&path) {
-                attr.ino = (attr.ino & SOURCE_INODE_MASK) | (idx << 48);
+                attr.ino = INode::File(idx, attr.ino).into();
                 return Some(attr);
             }
         }
         // no sources contained this file.
         None
     }
+}
+
+fn inject_source_index(n: INode, s: u16) -> INode {
+    match n {
+        d @ INode::Dir(_) => d,
+        INode::File(_, ino) => INode::File(s, ino),
+    }
+}
+fn check_file_handle_read(file_handle: u64) -> bool {
+    (file_handle & FILE_HANDLE_READ_BIT) != 0
 }
 
 impl Filesystem for MergedFS {
@@ -149,7 +160,36 @@ impl Filesystem for MergedFS {
         lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        todo!()
+        let mut buf = vec![0; size as usize];
+        // if !check_file_handle_read(fh) {
+        //     reply.error(libc::EACCES);
+        //     return;
+        // }
+        let ino = INode::from(ino);
+        match ino {
+            INode::Dir(_) => {
+                warn!("MergedFS::read attempted to read a directory. {:?}", ino);
+                reply.error(EINVAL);
+                return;
+            }
+            INode::File(src, src_ino) => {
+                let source = self.sources.get(src as usize);
+                if let None = source {
+                    warn!("MergedFS::read attempted to fetch an inode {:?} from a non-existent source {}", ino, src);
+                    reply.error(ENOENT);
+                    return;
+                }
+                let source = source.unwrap();
+                let res = source.read(src_ino, offset, size, &mut buf);
+                if let Err(e) = res {
+                    error!("MergedFS::read error reading form inode {:?}: {}", ino, e);
+                    reply.error(EIO);
+                    return;
+                }
+                let amount_read = res.unwrap();
+                reply.data(&buf[0..amount_read]);
+            }
+        }
     }
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
@@ -235,46 +275,45 @@ impl Filesystem for MergedFS {
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
         debug!("MergedFS::getattr({:#x})", ino);
+        let ino = INode::from(ino);
+        let attr = match ino {
+            d @ INode::Dir(ino) => {
+                // directory
+                let attr = self.get_attr_dir(d);
+                if let None = attr {
+                    debug!("MergedFS::getattr -- directory inode {:#x} not found", ino);
+                    reply.error(libc::ENOENT);
+                    return;
+                }
 
-        if ino == 1 || (IS_DIR_MASK & ino) > 0 {
-            // directory
-            let attr = self.get_attr_dir(ino);
-            if let None = attr {
-                debug!("directory inode {:#x} not found", ino);
-                reply.error(libc::ENOENT);
-                return;
+                attr.unwrap()
             }
-
-            let attr = attr.unwrap();
-            debug!("returning attributes {:?}", attr);
-            reply.attr(&TTL, &attr);
-            return;
-        }
-
-        let source = (ino & MERGED_SOURCE_MASK) >> 48;
-
-        let src = self.sources.get(source as usize);
-        if let None = src {
-            debug!("file inode {:#x} not found", ino);
-            reply.error(libc::ENOENT);
-            return;
-        }
-        let src = src.unwrap();
-        let src_inode = ino & SOURCE_INODE_MASK;
-        let attr = src.fuse_attr(src_inode);
-        if let Err(e) = attr {
-            if e.kind() == ErrorKind::NotFound {
-                reply.error(libc::ENOENT);
-            } else {
-                error!(
-                    "error getting attributes for inode {:#x} -> ({}, {}): {}",
-                    ino, source, src_inode, e
-                );
-                reply.error(libc::EFAULT);
+            INode::File(src_idx, ino) => {
+                let src = self.sources.get(src_idx as usize);
+                if let None = src {
+                    debug!("MergedFS::getattr -- file inode {:#x} not found", ino);
+                    reply.error(libc::ENOENT);
+                    return;
+                }
+                let src = src.unwrap();
+                let attr = src.fuse_attr(ino);
+                if let Err(e) = attr {
+                    if e.kind() == ErrorKind::NotFound {
+                        reply.error(libc::ENOENT);
+                    } else {
+                        error!(
+                            "error getting attributes for inode {:#x} -> ({}, {}): {}",
+                            ino, src_idx, ino, e
+                        );
+                        reply.error(libc::EFAULT);
+                    }
+                    return;
+                }
+                attr.unwrap()
             }
-            return;
-        }
-        let attr = attr.unwrap();
+        };
+
+        debug!("returning attributes {:?}", attr);
         reply.attr(&TTL, &attr);
     }
 
@@ -291,22 +330,25 @@ impl Filesystem for MergedFS {
             debug!("MergedFS::readdir -- readdir of root");
             // root
             Ok(self.read_dir("/"))
-        } else if (ino & IS_DIR_MASK) == 0 {
-            error!(
-                "MergedFS::readdir -- readdir on {:#x} is not a directory",
-                ino
-            );
-            // not a directory
-            Err(libc::EINVAL)
         } else {
-            debug!("MergedFS::readdir -- readdir of non-root directory");
-            // look up the directory path from its inode
-            match self
-                .directories
-                .lookup_merged_path_from_inode(ino & SOURCE_INODE_MASK)
-            {
-                None => Err(ENOENT),
-                Some(x) => Ok(self.read_dir(PathBuf::from(x))),
+            let ino = INode::from(ino);
+            match ino {
+                INode::File(_, _) => {
+                    error!(
+                        "MergedFS::readdir -- readdir on {:?} is not a directory",
+                        ino
+                    );
+                    // not a directory
+                    Err(libc::EINVAL)
+                }
+                INode::Dir(dir_ino) => {
+                    debug!("MergedFS::readdir -- readdir of non-root directory");
+                    // look up the directory path from its inode
+                    match self.directories.lookup_merged_path_from_inode(dir_ino) {
+                        None => Err(ENOENT),
+                        Some(x) => Ok(self.read_dir(PathBuf::from(x))),
+                    }
+                }
             }
         };
 
@@ -339,7 +381,7 @@ impl Filesystem for MergedFS {
                 PathBuf::from(dir.d.file_name()).display()
             );
 
-            if reply.add(dir.inode, i, file_type, dir.d.file_name()) {
+            if reply.add(dir.inode.into(), i, file_type, dir.d.file_name()) {
                 debug!("buffer is full skipping at offset {}", i);
                 break;
             }
@@ -359,11 +401,11 @@ impl<'a> Iterator for ReadDir<'a> {
     type Item = Result<DirEntry<'a>, std::io::Error>;
     fn next(&mut self) -> Option<Self::Item> {
         debug!("MergedFS::ReadDir::next");
-        while let Some((idx, read_dir)) = &mut self.current {
+        while let Some((source_index, read_dir)) = &mut self.current {
             let val = read_dir.next();
             debug!(
                 "MergedFS::ReadDir::next -- next val on source {} is {:?}",
-                idx, val
+                source_index, val
             );
             match val {
                 Some(Ok(d)) => {
@@ -383,7 +425,7 @@ impl<'a> Iterator for ReadDir<'a> {
                             .src
                             .directories
                             .lookup_insert_inode_from_merged_path(&os_str);
-                        let inode = (dir_inode & SOURCE_INODE_MASK) | IS_DIR_MASK;
+                        let inode = INode::Dir(dir_inode);
                         debug!(
                             "MergedFS::ReadDir::next -- come across dir {} inode {:#x}",
                             PathBuf::from(&os_str).display(),
@@ -393,12 +435,11 @@ impl<'a> Iterator for ReadDir<'a> {
                         return Some(Ok(DirEntry { inode, d }));
                     }
 
-                    let inode = (MERGED_SOURCE_MASK & ((*idx as u64) << 48)) // store the source index in the first two bytes of the inode number.
-                    | (SOURCE_INODE_MASK & d.ino()); // and the source inode in the rest...
+                    let inode = INode::File(*source_index, d.ino());
                     debug!(
                         "MergedFS::ReadDir::next -- come across file {} in source {:#x} inode {:#x}",
                         PathBuf::from(d.path_within_source().into_os_string()).display(),
-                        idx,
+                        source_index,
                         inode,
                     );
 
@@ -416,16 +457,16 @@ impl<'a> Iterator for ReadDir<'a> {
 }
 
 pub struct DirEntry<'a> {
-    inode: u64,
+    inode: INode,
     d: source::DirEntry<'a>,
 }
 
 impl<'a> DirEntry<'a> {
-    fn from_dir_entry(d: source::DirEntry<'a>, inode: u64) -> Self {
+    fn from_dir_entry(d: source::DirEntry<'a>, inode: INode) -> Self {
         DirEntry { inode, d }
     }
 
-    fn ino(&self) -> u64 {
+    fn ino(&self) -> INode {
         self.inode
     }
 }

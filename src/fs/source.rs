@@ -1,9 +1,12 @@
-use crate::fs::inode::INodeTable;
+use crate::fs::inode::{INode, INodeTable};
 use fuser::FileAttr;
+use std::cmp::min;
 use std::ffi::OsString;
 use std::fs;
+use std::fs::File;
 use std::io;
 use std::io::ErrorKind;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::result::Result;
 
@@ -12,7 +15,7 @@ use crate::fs::attrs;
 #[derive(Debug)]
 pub struct Source {
     root: PathBuf,
-    inodes: INodeTable,
+    inodes: INodeTable<u64>,
 }
 
 impl<'a> Source {
@@ -22,6 +25,34 @@ impl<'a> Source {
             root,
             inodes: INodeTable::new(),
         }
+    }
+
+    pub fn read(
+        &self,
+        ino: u64,
+        offset: i64,
+        mut amount_to_read: u32,
+        buf: &mut [u8],
+    ) -> io::Result<usize> {
+        let path = self.inodes.lookup_merged_path_from_inode(ino);
+        if let None = path {
+            return Err(io::Error::new(ErrorKind::NotFound, "not found"));
+        }
+        let path = path.unwrap();
+        let fh = File::open(&self.extend_root(path));
+
+        if let Err(e) = fh {
+            return Err(e);
+        }
+        let fh = fh.unwrap();
+
+        let remaining_file_size = fh.metadata().unwrap().len() as i64 - offset;
+        let amount_to_read = min(
+            amount_to_read as usize,
+            min(remaining_file_size as usize, buf.len() as usize),
+        );
+
+        return fh.read_at(&mut buf[0..amount_to_read], offset as u64);
     }
 
     pub fn statfs(&self) -> io::Result<crate::fs::stats::FSStats> {
@@ -153,7 +184,7 @@ impl<'a> DirEntry<'a> {
     }
 
     pub fn ino(&self) -> u64 {
-        self.inode
+        self.inode.into()
     }
 
     pub fn file_name(&self) -> OsString {
