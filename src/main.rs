@@ -5,6 +5,7 @@ extern crate log;
 use fuser::MountOption;
 use std::env;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 const TTL: Duration = Duration::from_millis(50000);
@@ -22,8 +23,8 @@ fn main() {
             return;
         }
     };
-
-    let merged_fs = fs::merged::MergedFS::new(rest.iter().map(|x| Path::new(x)));
+    let fhm = Arc::new(fs::file_handle::FileHandleManager::new());
+    let merged_fs = fs::merged::MergedFS::new(rest.iter().map(|x| Path::new(x)), fhm);
     fuser::mount2(
         merged_fs,
         mp,

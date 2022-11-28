@@ -3,18 +3,20 @@ use crate::fs::source::Source;
 use crate::{fs, TTL};
 
 use crate::fs::attrs::fuse_attr;
+use crate::fs::file_handle::{FileHandleManager, Mode};
 use crate::fs::source;
 use fuser::FileType::{Directory, RegularFile};
 use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyStatfs, Request,
+    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
 };
-use libc::{c_int, EINVAL, EIO, ENOENT};
+use libc::{c_int, EACCES, EINVAL, EIO, ENOENT, O_RDONLY, O_TRUNC};
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 use std::{io, mem};
 
@@ -23,17 +25,21 @@ const FILE_HANDLE_READ_BIT: u64 = 1 << 63;
 pub struct MergedFS {
     sources: Vec<Source>,
     directories: INodeTable<u64>, // directories are mapped across all disks.
+    fhm: Arc<FileHandleManager>,
 }
 
 impl MergedFS {
-    pub fn new<'a, I>(paths: I) -> Self
+    pub fn new<'a, I>(paths: I, fhm: Arc<FileHandleManager>) -> Self
     where
         I: Iterator<Item = &'a Path>,
     {
         debug!("MergedFS::new(...)");
         MergedFS {
-            sources: paths.map(|root| Source::new(root.to_path_buf())).collect(),
+            sources: paths
+                .map(|root| Source::new(root.to_path_buf(), fhm.clone()))
+                .collect(),
             directories: INodeTable::new(),
+            fhm,
         }
     }
 
@@ -149,45 +155,161 @@ fn check_file_handle_read(file_handle: u64) -> bool {
 }
 
 impl Filesystem for MergedFS {
-    fn read(
+    fn release(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        debug!("MergedFS::release(fh: {:#x})", fh,);
+        match self.fhm.close(fh) {
+            Ok(()) => reply.ok(),
+            Err(x) => {
+                error!(
+                    "MergedFS::release(fh: {:#x}) -- error releasing handle: {}",
+                    fh, x
+                );
+                reply.error(EIO)
+            }
+        }
+    }
+
+    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        debug!("MergedFS::open(ino: {:#x}, flags:{:#x})", ino, flags,);
+        if let INode::File(src, ino) = INode::from(ino) {
+            let src = self.sources.get(src as usize);
+            if let None = src {
+                error!("MergedFS::open(ino: {:#x}, flags:{:#x}) -- inode references a source that does not exist", ino, flags);
+                reply.error(EINVAL);
+                return;
+            }
+            let src = src.unwrap();
+            let mode = match flags & libc::O_ACCMODE {
+                libc::O_RDONLY => {
+                    if flags & libc::O_TRUNC != 0 {
+                        error!("MergedFS::open(ino: {:#x}, flags:{:#x}) -- O_TRUNC ({:#x}) on a O_RDONLY ({:#x}) open", ino, flags, O_TRUNC, O_RDONLY);
+                        reply.error(EACCES);
+                        return;
+                    }
+                    Mode::Read
+                }
+                libc::O_WRONLY => {
+                    if flags & libc::O_TRUNC == 0 {
+                        Mode::Append(flags & libc::O_CREAT != 0)
+                    } else {
+                        Mode::Trunc(flags & libc::O_CREAT != 0)
+                    }
+                }
+                libc::O_RDWR => {
+                    if flags & libc::O_TRUNC == 0 {
+                        Mode::Append(flags & libc::O_CREAT != 0)
+                    } else {
+                        Mode::Trunc(flags & libc::O_CREAT != 0)
+                    }
+                }
+                _ => {
+                    error!(
+                        "MergedFS::open(ino: {:#x}, flags:{:#x}) -- unrecognised mode",
+                        ino, flags
+                    );
+                    reply.error(libc::EINVAL);
+                    return;
+                }
+            };
+            match src.open(ino, mode) {
+                Err(e) => {
+                    let err = match e.kind() {
+                        ErrorKind::NotFound => ENOENT,
+                        _ => EIO,
+                    };
+                    error!(
+                        "MergedFS::open(ino: {:#x}, flags:{:#x}) -- error opening file {}",
+                        ino, flags, err
+                    );
+                    reply.error(err);
+                    return;
+                }
+                Ok(x) => {
+                    reply.opened(x, 0);
+                }
+            }
+        }
+    }
+
+    fn write(
         &mut self,
         _req: &Request<'_>,
         ino: u64,
         fh: u64,
         offset: i64,
-        size: u32,
+        data: &[u8],
+        write_flags: u32,
+        flags: i32,
+        lock_owner: Option<u64>,
+        reply: ReplyWrite,
+    ) {
+        debug!(
+            "MergedFS::write(fh:{}, offset:{}, data_len:{})",
+            fh,
+            offset,
+            data.len(),
+        );
+
+        match self.fhm.write(fh, offset as u64, data) {
+            Err(e) => {
+                reply.error(EIO);
+            }
+            Ok(x) => {
+                reply.written(x as u32);
+            }
+        }
+    }
+
+    fn read(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        offset: i64,
+        requested_read_size: u32,
         flags: i32,
         lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        let mut buf = vec![0; size as usize];
-        // if !check_file_handle_read(fh) {
-        //     reply.error(libc::EACCES);
-        //     return;
-        // }
-        let ino = INode::from(ino);
-        match ino {
-            INode::Dir(_) => {
-                warn!("MergedFS::read attempted to read a directory. {:?}", ino);
-                reply.error(EINVAL);
+        debug!(
+            "MergedFS::read(fh:{}, offset:{}, requested_read:{})",
+            fh, offset, requested_read_size
+        );
+        let file_size = match self.fhm.size(fh) {
+            Err(x) => {
+                warn!("MergedFS::read(fh:{}, offset:{}, requested_read:{}) -- error getting handle {} during read. {}", fh, offset, requested_read_size, fh, x);
+                reply.error(EIO);
                 return;
             }
-            INode::File(src, src_ino) => {
-                let source = self.sources.get(src as usize);
-                if let None = source {
-                    warn!("MergedFS::read attempted to fetch an inode {:?} from a non-existent source {}", ino, src);
-                    reply.error(ENOENT);
-                    return;
-                }
-                let source = source.unwrap();
-                let res = source.read(src_ino, offset, size, &mut buf);
-                if let Err(e) = res {
-                    error!("MergedFS::read error reading form inode {:?}: {}", ino, e);
-                    reply.error(EIO);
-                    return;
-                }
-                let amount_read = res.unwrap();
-                reply.data(&buf[0..amount_read]);
+            Ok(x) => x,
+        };
+        let read_amount = if (requested_read_size as i64) + offset > file_size as i64 {
+            // we'd read off the end of the file , so reduce the requested_read_size to the
+            // remaining number of bytes.
+            file_size - offset as u64
+        } else {
+            requested_read_size as u64
+        };
+        let mut buf = vec![0 as u8; read_amount as usize];
+        match self.fhm.read(fh, offset as u64, buf.as_mut_slice()) {
+            Err(e) => {
+                warn!(
+                    "MergedFS::read(fh:{}, offset:{}, requested_read:{}) -- error reading {} bytes of handle {}: {}",
+                    fh, offset, requested_read_size, read_amount, fh, e
+                );
+                reply.error(EIO);
+            }
+            Ok(x) => {
+                reply.data(&buf[0..x]);
             }
         }
     }

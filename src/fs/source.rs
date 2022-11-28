@@ -9,21 +9,44 @@ use std::io::ErrorKind;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::result::Result;
+use std::sync::Arc;
 
 use crate::fs::attrs;
+use crate::fs::file_handle::{FileHandleManager, Mode};
 
 #[derive(Debug)]
 pub struct Source {
     root: PathBuf,
     inodes: INodeTable<u64>,
+    fhm: Arc<FileHandleManager>,
 }
 
 impl<'a> Source {
-    pub fn new(root: PathBuf) -> Self {
+    pub fn new(root: PathBuf, fhm: Arc<FileHandleManager>) -> Self {
         debug!("Source::new({})", root.display());
         Source {
             root,
             inodes: INodeTable::new(),
+            fhm,
+        }
+    }
+
+    pub fn open(&self, ino: u64, mode: Mode) -> io::Result<u64> {
+        let path = self.merged_path_from_inode(ino)?;
+        let path = self.extend_root(path);
+        self.fhm.open(path, mode)
+    }
+
+    pub fn close(&self, ino: u64) -> io::Result<()> {
+        self.fhm.close(ino)
+    }
+
+    fn merged_path_from_inode(&self, ino: u64) -> io::Result<PathBuf> {
+        let path = self.inodes.lookup_merged_path_from_inode(ino);
+        if let None = path {
+            Err(io::Error::new(ErrorKind::NotFound, "not found"))
+        } else {
+            Ok(PathBuf::from(path.unwrap()))
         }
     }
 
@@ -31,14 +54,10 @@ impl<'a> Source {
         &self,
         ino: u64,
         offset: i64,
-        mut amount_to_read: u32,
+        amount_to_read: u32,
         buf: &mut [u8],
     ) -> io::Result<usize> {
-        let path = self.inodes.lookup_merged_path_from_inode(ino);
-        if let None = path {
-            return Err(io::Error::new(ErrorKind::NotFound, "not found"));
-        }
-        let path = path.unwrap();
+        let path = self.merged_path_from_inode(ino)?;
         let fh = File::open(&self.extend_root(path));
 
         if let Err(e) = fh {

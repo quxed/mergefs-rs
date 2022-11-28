@@ -1,3 +1,4 @@
+pub mod file_handle;
 pub mod inode;
 pub mod merged;
 pub mod source;
