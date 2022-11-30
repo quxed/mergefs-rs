@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt::{Debug, Formatter, LowerHex};
 use std::ops::Add;
+use std::path::PathBuf;
 use std::sync::RwLock;
 
 const SOURCE_INODE_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
@@ -135,6 +136,57 @@ where
         // insert root.
         item.add_inode_for_merged_path_safe(OsString::from("/"));
         return item;
+    }
+
+    pub fn drop_path(&self, str: &OsString) -> Option<T> {
+        debug!("INodeTable::drop_path({:?})", str.clone());
+        let ino = self.lookup_inode_from_merged_path(str);
+        if let None = ino {
+            // doesn't exist anyway.
+            return None;
+        }
+        let ino = ino.unwrap();
+
+        let fields = self.fields.write();
+        if let Err(_) = fields {
+            debug!(
+                "INodeTable::drop_path({:?}) -- lock is poisoned",
+                str.clone()
+            );
+            return None;
+        }
+
+        let mut fields = fields.unwrap();
+        fields.inode_to_merged_path.remove(&ino);
+        fields.merged_path_to_inode.remove(str)
+    }
+
+    pub fn drop_paths_with_prefix(&self, str: &OsString) -> Option<()> {
+        debug!("INodeTable::drop_paths_with_prefix({:?})", str.clone());
+        let fields = self.fields.write();
+        if let Err(_) = fields {
+            debug!(
+                "INodeTable::drop_paths_with_prefix({:?}) -- lock is poisoned",
+                str.clone()
+            );
+            return None;
+        }
+        let prefix = PathBuf::from(str);
+        let mut fields = fields.unwrap();
+        let mut values_to_drop = Vec::new();
+        {
+            for (k, ino) in &fields.merged_path_to_inode {
+                let pb = PathBuf::from(&k);
+                if pb.starts_with(&prefix) {
+                    values_to_drop.push((k.clone(), ino.clone()));
+                }
+            }
+        }
+        for (k, ino) in values_to_drop {
+            fields.merged_path_to_inode.remove(&k);
+            fields.inode_to_merged_path.remove(&ino);
+        }
+        Some(())
     }
 
     pub fn lookup_inode_from_merged_path(&self, str: &OsString) -> Option<T> {

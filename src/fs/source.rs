@@ -1,9 +1,10 @@
-use crate::fs::inode::{INode, INodeTable};
-use fuser::FileAttr;
+use crate::fs::inode::INodeTable;
+use fuser::FileType::Directory;
+use fuser::{FileAttr, FileType};
 use std::cmp::min;
 use std::ffi::OsString;
 use std::fs;
-use std::fs::File;
+use std::fs::{create_dir_all, File};
 use std::io;
 use std::io::ErrorKind;
 use std::os::unix::fs::FileExt;
@@ -12,6 +13,7 @@ use std::result::Result;
 use std::sync::Arc;
 
 use crate::fs::attrs;
+use crate::fs::attrs::fuse_attr;
 use crate::fs::file_handle::{FileHandleManager, Mode};
 
 #[derive(Debug)]
@@ -109,22 +111,136 @@ impl<'a> Source {
         }
     }
 
-    pub fn create_dir<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+    pub fn create_dir<P: AsRef<Path>>(&self, path: P) -> io::Result<FileAttr> {
         debug!(
             "Source::{}::create_dir({})",
             self.root.display(),
             path.as_ref().display()
         );
-        fs::create_dir(self.extend_root(path))
+        let real_path = self.extend_root(&path);
+        if let Err(x) = fs::create_dir(&real_path) {
+            return Err(x);
+        }
+        fuse_attr(
+            self.inodes.lookup_insert_inode_from_merged_path(
+                &PathBuf::from(path.as_ref()).into_os_string(),
+            ),
+            &real_path,
+        )
     }
 
-    pub fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+    pub fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> io::Result<FileAttr> {
         debug!(
             "Source::{}::create_dir_all({})",
             self.root.display(),
             path.as_ref().display()
         );
-        fs::create_dir_all(self.extend_root(path))
+        let real_path = self.extend_root(&path);
+        if let Err(x) = create_dir_all(&real_path) {
+            return Err(x);
+        }
+        fuse_attr(
+            self.inodes.lookup_insert_inode_from_merged_path(
+                &PathBuf::from(path.as_ref()).into_os_string(),
+            ),
+            &real_path,
+        )
+    }
+
+    pub fn unlink<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        let real_path = self.extend_root(&path);
+        let path = PathBuf::from(path.as_ref()).into_os_string();
+        let attrs = fuse_attr(
+            self.inodes.lookup_insert_inode_from_merged_path(&path),
+            &real_path,
+        )?;
+        if attrs.kind != FileType::RegularFile {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "cannot unlink a non-regular file",
+            ));
+        }
+        fs::remove_file(real_path)?;
+        self.inodes.drop_path(&path);
+        Ok(())
+    }
+
+    pub fn rmdir<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        let real_path = self.extend_root(&path);
+        let path = PathBuf::from(path.as_ref()).into_os_string();
+        let attrs = fuse_attr(
+            self.inodes.lookup_insert_inode_from_merged_path(&path),
+            &real_path,
+        )?;
+        if attrs.kind != Directory {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "cannot unlink a non-regular file",
+            ));
+        }
+        if self.read_dir(&path)?.count() > 0 {
+            return Err(io::Error::new(ErrorKind::Other, "directory is not empty"));
+        }
+        fs::remove_dir(real_path)?;
+        self.inodes.drop_paths_with_prefix(&path);
+        return Ok(());
+    }
+
+    pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> io::Result<()> {
+        debug!(
+            "Source::{}::rename(from: {}, to: {})",
+            self.root.display(),
+            from.as_ref().display(),
+            to.as_ref().display(),
+        );
+
+        let attrs = self.fuse_attr_path(&from)?;
+        if attrs.kind == Directory {
+            debug!(
+                "Source::{}::rename(from: {}, to: {}) -- directory",
+                self.root.display(),
+                from.as_ref().display(),
+                to.as_ref().display(),
+            );
+            self.inodes
+                .drop_paths_with_prefix(&PathBuf::from(from.as_ref()).into_os_string());
+        } else {
+            debug!(
+                "Source::{}::rename(from: {}, to: {}) -- regular file",
+                self.root.display(),
+                from.as_ref().display(),
+                to.as_ref().display(),
+            );
+            self.inodes
+                .drop_path(&PathBuf::from(from.as_ref()).into_os_string());
+        }
+
+        let full_from = self.extend_root(from);
+        let full_to = self.extend_root(to);
+
+        if let Some(new_parent) = full_to.parent() {
+            create_dir_all(new_parent)?
+        }
+
+        fs::rename(full_from, full_to)
+    }
+
+    pub fn create<P: AsRef<Path>>(&self, merged_path: P, mode: u32) -> io::Result<(FileAttr, u64)> {
+        debug!(
+            "Source::{}::create(path:{}, mode:{})",
+            self.root.display(),
+            merged_path.as_ref().display(),
+            mode,
+        );
+
+        let merged_path = merged_path.as_ref().to_path_buf();
+        let full_path = self.extend_root(&merged_path);
+        let file_handle = self.fhm.create(&full_path)?;
+        let ino = self
+            .inodes
+            .lookup_insert_inode_from_merged_path(&merged_path.into_os_string());
+        let file_attrs = fuse_attr(ino, full_path)?;
+        Ok((file_attrs, file_handle))
     }
 
     pub fn metadata<P: AsRef<Path>>(&self, path: P) -> io::Result<fs::Metadata> {
@@ -145,7 +261,7 @@ impl<'a> Source {
         let pb = path.as_ref().to_path_buf().into_os_string();
 
         if let Some(ino) = self.inodes.lookup_inode_from_merged_path(&pb) {
-            attrs::fuse_attr(ino, self.extend_root(path))
+            fuse_attr(ino, self.extend_root(path))
         } else {
             Err(io::Error::new(ErrorKind::NotFound, "not found"))
         }
@@ -155,10 +271,10 @@ impl<'a> Source {
         debug!("Source::{}::fuse_attr({})", self.root.display(), ino);
         let path = self.inodes.lookup_merged_path_from_inode(ino);
         if let None = path {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "not found"));
+            return Err(io::Error::new(ErrorKind::NotFound, "not found"));
         }
         let path = path.unwrap();
-        attrs::fuse_attr(ino, self.extend_root(path))
+        fuse_attr(ino, self.extend_root(path))
     }
 }
 
@@ -168,7 +284,7 @@ pub struct ReadDir<'a> {
 }
 
 impl<'a> Iterator for ReadDir<'a> {
-    type Item = Result<DirEntry<'a>, std::io::Error>;
+    type Item = Result<DirEntry<'a>, io::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         debug!("Source::{}::Iterator::next", self.src.root.display());

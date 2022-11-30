@@ -9,7 +9,6 @@ use crate::fs::file_handle::FileHandle::{ReadOnly, ReadWrite};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Debug)]
-
 pub enum Mode {
     Read,
     Trunc(bool),
@@ -62,13 +61,22 @@ impl FileHandleManager {
         }
     }
 
+    pub fn create<P: AsRef<Path>>(&self, path: P) -> io::Result<u64> {
+        self.open(path, Mode::Trunc(true))
+    }
+
     pub fn open<P: AsRef<Path>>(&self, path: P, mode: Mode) -> io::Result<u64> {
+        debug!(
+            "FileHandleManager::open(path: {}, mode: {:?})",
+            path.as_ref().display(),
+            mode
+        );
         let mut fields = self.obtain_write_lock()?;
         let mut opts = &mut fs::OpenOptions::new();
         opts = match &mode {
             Mode::Read => opts.read(true),
-            Mode::Trunc(_) => opts.truncate(true).create(mode.create()),
-            Mode::Append(_) => opts.append(true).create(mode.create()),
+            Mode::Trunc(_) => opts.write(true).truncate(true).create(mode.create()),
+            Mode::Append(_) => opts.write(true).append(true).create(mode.create()),
         };
         let f = opts.open(path);
         if let Err(e) = f {

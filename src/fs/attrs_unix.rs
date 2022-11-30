@@ -33,7 +33,7 @@ pub fn fsstat<P: AsRef<path::Path>>(p: P) -> io::Result<FSStats> {
     Ok(out)
 }
 
-pub fn fuse_attr<P: AsRef<path::Path>>(ino: u64, p: P) -> io::Result<fuser::FileAttr> {
+pub fn fuse_attr<P: AsRef<path::Path>>(ino: u64, p: P) -> io::Result<FileAttr> {
     let p = p.as_ref();
     let md = fs::metadata(p)?;
 
