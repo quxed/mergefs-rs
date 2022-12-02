@@ -7,9 +7,9 @@ use crate::fs::source;
 use fuser::FileType::{Directory, RegularFile};
 use fuser::{
     FileAttr, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
+    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
-use libc::{EACCES, EINVAL, EIO, ENOENT, ENOTEMPTY, O_RDONLY, O_TRUNC};
+use libc::{EACCES, EINVAL, EIO, ENOENT, O_RDONLY, O_TRUNC};
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
@@ -30,9 +30,17 @@ impl MergedFS {
         I: Iterator<Item = &'a Path>,
     {
         debug!("MergedFS::new(...)");
+        let paths: Vec<PathBuf> = paths.map(|x| PathBuf::from(x)).collect();
+        for p in &paths {
+            if p.is_relative() {
+                panic!("paths must be absolute. {} is relative", p.display());
+            }
+        }
+
         MergedFS {
             sources: paths
-                .map(|root| Source::new(root.to_path_buf(), fhm.clone()))
+                .iter()
+                .map(|root| Source::new(PathBuf::from(root), fhm.clone()))
                 .collect(),
             directories: INodeTable::new(),
             fhm,
@@ -212,83 +220,6 @@ fn inject_source_index(n: INode, s: u16) -> INode {
 }
 
 impl Filesystem for MergedFS {
-    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        debug!("MergedFS::rmdir(parent:{:#x}, name:{:?})", parent, name);
-        let path = self.extend_dir_path_by_inode(parent, name);
-        if let Err(e) = path {
-            debug!(
-                "MergedFS::rmdir(parent:{:#x}, name:{:?}) -- cannot extend path {}",
-                parent, name, e
-            );
-            reply.error(EIO);
-            return;
-        }
-        let path = path.unwrap();
-
-        for src in &self.sources {
-            if let Err(e) = src.rmdir(&path) {
-                if e.kind() != ErrorKind::NotFound {
-                    debug!(
-                        "MergedFS::rmdir(parent:{:#x}, name:{:?}) -- error deleting from source {}",
-                        parent, name, e
-                    );
-                    // ignore not founds...
-                    reply.error(EIO);
-                    return;
-                }
-            }
-        }
-        reply.ok();
-    }
-
-    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        debug!("MergedFS::unlink(parent:{:#x}, name:{:?})", parent, name);
-        let path = self.extend_dir_path_by_inode(parent, name);
-        if let Err(e) = path {
-            debug!(
-                "MergedFS::unlink(parent:{:#x}, name:{:?}) -- cannot extend path {}",
-                parent, name, e
-            );
-            reply.error(EIO);
-            return;
-        }
-        let path = path.unwrap();
-        let attrs = self.fuse_attr_from_path(&path);
-        if let None = attrs {
-            reply.error(ENOENT);
-            return;
-        }
-        let attrs = attrs.unwrap();
-        match INode::from(attrs.ino) {
-            INode::Dir(x) => {
-                reply.error(EINVAL);
-                return;
-            }
-            INode::File(src, ino) => {
-                let source = self.sources.get(src as usize);
-                if let None = source {
-                    warn!(
-                        "MergedFS::unlink(parent:{:#x}, name:{:?}) -- no source with id {:#x}",
-                        parent, name, src
-                    );
-                    reply.error(EIO);
-                    return;
-                }
-                let source = source.unwrap();
-                match source.unlink(path) {
-                    Err(e) => {
-                        warn!(
-                            "MergedFS::unlink(parent:{:#x}, name:{:?}) -- error unlinking file {}",
-                            parent, name, e
-                        );
-                        reply.error(EIO);
-                    }
-                    Ok(_) => reply.ok(),
-                }
-            }
-        }
-    }
-
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         debug!("MergedFS::lookup(parent:{:#x}, name:{:?})", parent, name);
 
@@ -419,6 +350,82 @@ impl Filesystem for MergedFS {
         }
     }
 
+    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        debug!("MergedFS::unlink(parent:{:#x}, name:{:?})", parent, name);
+        let path = self.extend_dir_path_by_inode(parent, name);
+        if let Err(e) = path {
+            debug!(
+                "MergedFS::unlink(parent:{:#x}, name:{:?}) -- cannot extend path {}",
+                parent, name, e
+            );
+            reply.error(EIO);
+            return;
+        }
+        let path = path.unwrap();
+        let attrs = self.fuse_attr_from_path(&path);
+        if let None = attrs {
+            reply.error(ENOENT);
+            return;
+        }
+        let attrs = attrs.unwrap();
+        match INode::from(attrs.ino) {
+            INode::Dir(_) => {
+                reply.error(EINVAL);
+                return;
+            }
+            INode::File(src, _) => {
+                let source = self.sources.get(src as usize);
+                if let None = source {
+                    warn!(
+                        "MergedFS::unlink(parent:{:#x}, name:{:?}) -- no source with id {:#x}",
+                        parent, name, src
+                    );
+                    reply.error(EIO);
+                    return;
+                }
+                let source = source.unwrap();
+                match source.unlink(path) {
+                    Err(e) => {
+                        warn!(
+                            "MergedFS::unlink(parent:{:#x}, name:{:?}) -- error unlinking file {}",
+                            parent, name, e
+                        );
+                        reply.error(EIO);
+                    }
+                    Ok(_) => reply.ok(),
+                }
+            }
+        }
+    }
+
+    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        debug!("MergedFS::rmdir(parent:{:#x}, name:{:?})", parent, name);
+        let path = self.extend_dir_path_by_inode(parent, name);
+        if let Err(e) = path {
+            debug!(
+                "MergedFS::rmdir(parent:{:#x}, name:{:?}) -- cannot extend path {}",
+                parent, name, e
+            );
+            reply.error(EIO);
+            return;
+        }
+        let path = path.unwrap();
+        for src in &self.sources {
+            if let Err(e) = src.rmdir(&path) {
+                if e.kind() != ErrorKind::NotFound {
+                    debug!(
+                        "MergedFS::rmdir(parent:{:#x}, name:{:?}) -- error deleting from source {}",
+                        parent, name, e
+                    );
+                    // ignore not founds...
+                    reply.error(EIO);
+                    return;
+                }
+            }
+        }
+        reply.ok();
+    }
+
     fn rename(
         &mut self,
         _req: &Request<'_>,
@@ -450,7 +457,7 @@ impl Filesystem for MergedFS {
             return;
         }
         let old_path = old_path.unwrap();
-        let new_path = self.extend_dir_path_by_inode(new_parent, old_name);
+        let new_path = self.extend_dir_path_by_inode(new_parent, new_name);
         if let Err(e) = new_path {
             error!(
                 "MergedFS::rename(old_parent:{}, old_name: {},new_parent:{}, new_name: {}) -- unable to extend new path: {}",
